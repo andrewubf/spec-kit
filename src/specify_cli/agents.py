@@ -9,6 +9,8 @@ command files into agent-specific directories in the correct format.
 import hashlib
 import os
 import re
+import secrets
+import stat
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -991,6 +993,59 @@ class CommandRegistrar:
         return registered
 
     @staticmethod
+    def _replace_file_text(dest: Path, content: str) -> None:
+        """Write ``content`` to ``dest`` by replacing its directory entry.
+
+        An in-place write reaches every hard link of the file, so an alias
+        linked to a file outside the project would carry the new text there
+        too. Writing a sibling temp file and renaming it over ``dest`` only
+        changes what ``dest`` names.
+
+        The replacement keeps an existing file's permission bits. A new file
+        is created with mode 0666 so the kernel applies the process umask,
+        the same as an in-place write; the umask itself is never changed.
+        The temp name has a fixed short length, so any name valid for
+        ``dest`` stays writable.
+        """
+        try:
+            dest_stat = os.lstat(dest)
+        except FileNotFoundError:
+            dest_stat = None
+        keep_mode = (
+            stat.S_IMODE(dest_stat.st_mode)
+            if dest_stat is not None and stat.S_ISREG(dest_stat.st_mode)
+            else None
+        )
+        # O_BINARY (Windows) leaves newline translation to the text wrapper
+        # below, as ``tempfile.mkstemp`` and ``Path.write_text`` do.
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        for _attempt in range(100):
+            temp_path = dest.parent / f".speckit-{secrets.token_hex(8)}.tmp"
+            try:
+                fd = os.open(temp_path, flags, 0o666)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError(
+                f"Could not create a temporary file next to {dest}"
+            )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            if keep_mode is not None:
+                os.chmod(temp_path, keep_mode)
+            os.replace(temp_path, dest)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
     def _write_registered_output(
         dest_file: Path,
         content: str,
@@ -1012,7 +1067,7 @@ class CommandRegistrar:
         if not link_outputs or (agent_config or {}).get("dev_no_symlink"):
             if dest_file.is_symlink():
                 dest_file.unlink()
-            dest_file.write_text(content, encoding="utf-8")
+            CommandRegistrar._replace_file_text(dest_file, content)
             after_file_change(dest_file)
             return
 
@@ -1024,7 +1079,7 @@ class CommandRegistrar:
         try:
             before_file_change(cache_file)
             cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(content, encoding="utf-8")
+            CommandRegistrar._replace_file_text(cache_file, content)
             after_file_change(cache_file)
             if dest_file.exists() or dest_file.is_symlink():
                 dest_file.unlink()
@@ -1036,7 +1091,7 @@ class CommandRegistrar:
             # functional by falling back to a copy.
             if dest_file.is_symlink():
                 dest_file.unlink()
-            dest_file.write_text(content, encoding="utf-8")
+            CommandRegistrar._replace_file_text(dest_file, content)
         after_file_change(dest_file)
 
     @staticmethod
